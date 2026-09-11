@@ -38,38 +38,26 @@ WATCHLIST = {
     "JU1424": {"pp": "—"}, "TCASL": {"pp": "—"}, "RH9489": {"pp": "—"}, "W62435": {"pp": "—"}
 }
 
-# ICAO -> IATA havayolu kod dönüşümleri (gerekirse otomatik yakalasın diye)
 ICAO_PREFIX_MAP = {
-    "IRZ": "B9",  # Iran Airtour
-    "AFL": "SU",  # Aeroflot
-    "THY": "TK",
-    "PGT": "PC",
-    "ROT": "RO",
-    "LOT": "LO",
-    "ETH": "ET",
-    "QTR": "QR",
-    "BAW": "BA",
-    "KLM": "KL",
-    "AFR": "AF",
-    "ASL": "JU"
+    "IRZ": "B9", "AFL": "SU", "THY": "TK", "PGT": "PC",
+    "ROT": "RO", "LOT": "LO", "ETH": "ET", "QTR": "QR",
+    "BAW": "BA", "KLM": "KL", "AFR": "AF", "ASL": "JU"
 }
 
+notified_60m = set()
 notified_30m = set()
 notified_landed = set()
 
 def clean_code(val):
-    if not val:
-        return ""
-    return re.sub(r"[^A-Z0-9]", "", str(val).upper())
+    return re.sub(r"[^A-Z0-9]", "", str(val).upper()) if val else ""
 
-# Watchlist anahtarlarını normalize et
 CLEAN_WATCHLIST = {clean_code(k): (k, v) for k, v in WATCHLIST.items()}
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK - Havas Radar Aktif")
+        self.wfile.write(b"OK - Havas Radar Calisiyor")
 
 def start_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -85,43 +73,43 @@ def send_telegram(text):
         "disable_web_page_preview": True
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        return r.status_code == 200
     except Exception as e:
-        print(f"Mesaj iletilemedi: {e}")
+        print(f"Telegram gonderim hatasi: {e}")
+        return False
 
 def get_fr24_ist_flights():
     url = "https://api.flightradar24.com/common/v1/airport.json?code=ist&plugin[]=&plugin-setting[schedule][mode]=arrivals&page=1&limit=100"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json"
     }
     try:
         r = requests.get(url, headers=headers, timeout=12)
         if r.status_code == 200:
             return r.json().get("result", {}).get("response", {}).get("airport", {}).get("pluginData", {}).get("schedule", {}).get("arrivals", {}).get("data", [])
+        else:
+            print(f"FR24 API Yanit Kodu: {r.status_code}")
     except Exception as err:
-        print(f"Radar veri hatasi: {err}")
+        print(f"Radar veri cekme hatasi: {err}")
     return []
 
 def match_flight(flight_number, callsign):
     c_number = clean_code(flight_number)
     c_callsign = clean_code(callsign)
 
-    # 1. Doğrudan numara eşleşmesi
     if c_number in CLEAN_WATCHLIST:
         return CLEAN_WATCHLIST[c_number]
-
-    # 2. Doğrudan çağrı kodu eşleşmesi
     if c_callsign in CLEAN_WATCHLIST:
         return CLEAN_WATCHLIST[c_callsign]
 
-    # 3. ICAO kodunu IATA'ya çevirip kontrol etme (örn: IRZ9710 -> B99710)
     for icao_pre, iata_pre in ICAO_PREFIX_MAP.items():
         if c_callsign.startswith(icao_pre):
-            converted = iata_pre + c_callsign[len(icao_pre):]
-            if converted in CLEAN_WATCHLIST:
-                return CLEAN_WATCHLIST[converted]
+            conv = iata_pre + c_callsign[len(icao_pre):]
+            if conv in CLEAN_WATCHLIST:
+                return CLEAN_WATCHLIST[conv]
 
-    # 4. Parçalı içerik eşleşmesi
     for clean_k, val in CLEAN_WATCHLIST.items():
         if (clean_k and clean_k in c_number) or (c_number and c_number in clean_k):
             return val
@@ -131,14 +119,16 @@ def match_flight(flight_number, callsign):
     return None, None
 
 def run_radar():
-    print("Havaş Radarı Başlatıldı.")
-    send_telegram("🚀 <b>Havaş IST Operasyon Radarı Devrede</b>\n\nTakip Listesi: 92 Uçuş\n* İnişe <30 dk kalanlar dakikaya göre sıralı liste\n* Teker koyanlar anlık onaylı bildirim")
+    print("Radar dongusu aktif...")
+    send_telegram("🚀 <b>Havaş IST Radar Sistemi Canlı Yayında!</b>\n\n• Frekans Yaklaşma (30-60 dk)\n• Son Yaklaşma (<30 dk)\n• Teker Koyma (İniş)")
 
     while True:
         try:
             flights = get_fr24_ist_flights()
             now_ts = int(time.time())
-            approaching_flights = []
+
+            approaching_30m = []
+            approaching_60m = []
 
             for f in flights:
                 f_info = f.get("flight", {})
@@ -162,7 +152,7 @@ def run_radar():
                 real_landing = time_info.get("real", {}).get("arrival")
                 est_landing = time_info.get("estimated", {}).get("arrival") or time_info.get("scheduled", {}).get("arrival")
 
-                # TEKER KOYDU (İNİŞ) BİLDİRİMİ
+                # 1. TEKER KOYMA (İNİŞ)
                 if "landed" in generic_status or real_landing is not None:
                     if original_key not in notified_landed:
                         notified_landed.add(original_key)
@@ -170,52 +160,66 @@ def run_radar():
                         msg = (
                             f"✅ <b>TEKER KOYDU (İNDİ)!</b>\n\n"
                             f"✈️ <b>{original_key}</b> ({origin} ➔ İST)\n"
-                            f"📍 Park Pozisyonu (PP): <code>{pp}</code>\n"
-                            f"🛬 Teker Saati: <b>{land_time}</b>\n"
-                            f"🏷️ Kuyruk / Tip: {reg} | {aircraft}"
+                            f"📍 <b>PP:</b> <code>{pp}</code>\n"
+                            f"🛬 <b>Teker Saati:</b> {land_time}\n"
+                            f"🏷️ {reg} | {aircraft}"
                         )
                         send_telegram(msg)
-                        print(f"[İNDİ]: {original_key}")
                     continue
 
-                # 30 DAKİKADAN AZ KALANLAR
+                # 2. SÜRE HESABI
                 if est_landing and original_key not in notified_landed:
                     diff_min = (est_landing - now_ts) // 60
+                    flight_card = {
+                        "key": original_key,
+                        "origin": origin,
+                        "pp": pp,
+                        "reg": reg,
+                        "aircraft": aircraft,
+                        "eta": time.strftime('%H:%M', time.localtime(est_landing)),
+                        "diff": diff_min
+                    }
+
                     if 0 < diff_min <= 30:
-                        approaching_flights.append({
-                            "key": original_key,
-                            "origin": origin,
-                            "pp": pp,
-                            "reg": reg,
-                            "aircraft": aircraft,
-                            "eta": time.strftime('%H:%M', time.localtime(est_landing)),
-                            "diff": diff_min
-                        })
+                        approaching_30m.append(flight_card)
+                    elif 30 < diff_min <= 60:
+                        approaching_60m.append(flight_card)
 
-            # Dakikaya göre en yakından uzağa sıralama
-            approaching_flights.sort(key=lambda x: x["diff"])
-
-            # Henüz bildirilmemiş yeni bir uçak hatta girdiyse güncel listeyi bas
-            new_faces = [fl for fl in approaching_flights if fl["key"] not in notified_30m]
-            if new_faces:
-                summary_lines = ["🚨 <b>YAKLAŞMA HATTI (&lt;30 DK KALANLAR)</b>\n"]
-                for fl in approaching_flights:
-                    summary_lines.append(
-                        f"⏱ <b>{fl['diff']} dk kaldı</b> | ETA: {fl['eta']}\n"
+            # --- SON YAKLAŞMA (<30 DK) LİSTESİ ---
+            approaching_30m.sort(key=lambda x: x["diff"])
+            new_30m = [fl for fl in approaching_30m if fl["key"] not in notified_30m]
+            if new_30m:
+                lines = ["🚨 <b>SON YAKLAŞMA (&lt;30 DK KALANLAR)</b>\n"]
+                for fl in approaching_30m:
+                    lines.append(
+                        f"⏱ <b>{fl['diff']} dk</b> | ETA: {fl['eta']}\n"
                         f"✈️ <b>{fl['key']}</b> ({fl['origin']} ➔ İST) | PP: <code>{fl['pp']}</code>\n"
                         f"🏷️ {fl['reg']} ({fl['aircraft']})\n"
                         f"──────────────"
                     )
                     notified_30m.add(fl["key"])
+                send_telegram("\n".join(lines))
 
-                send_telegram("\n".join(summary_lines))
-                print(f"[YAKLAŞMA]: {len(approaching_flights)} uçak listelendi.")
+            # --- FREKANSA GİRECEK (30-60 DK) LİSTESİ ---
+            approaching_60m.sort(key=lambda x: x["diff"])
+            new_60m = [fl for fl in approaching_60m if fl["key"] not in notified_60m and fl["key"] not in notified_30m]
+            if new_60m:
+                lines = ["📡 <b>FREKANSA GİRECEK UÇAKLAR (30-60 DK)</b>\n"]
+                for fl in approaching_60m:
+                    lines.append(
+                        f"⏱ <b>{fl['diff']} dk sonra</b> | ETA: {fl['eta']}\n"
+                        f"✈️ <b>{fl['key']}</b> ({fl['origin']} ➔ İST) | PP: <code>{fl['pp']}</code>\n"
+                        f"🏷️ {fl['reg']} ({fl['aircraft']})\n"
+                        f"──────────────"
+                    )
+                    notified_60m.add(fl["key"])
+                send_telegram("\n".join(lines))
 
-            time.sleep(35)
+            time.sleep(30)
 
         except Exception as loop_err:
-            print(f"Hata: {loop_err}")
-            time.sleep(25)
+            print(f"Dongu hatasi: {loop_err}")
+            time.sleep(20)
 
 if __name__ == "__main__":
     web_thread = threading.Thread(target=start_dummy_server, daemon=True)

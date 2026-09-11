@@ -1,5 +1,7 @@
-# main.py
+import os
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
 TELEGRAM_BOT_TOKEN = "8651100759:AAGrnwFEgP3KvBYXEipDgTGxICoGbU9zkb8"
@@ -38,6 +40,18 @@ WATCHLIST = {
 notified_30m = set()
 notified_landed = set()
 
+# Render Port Taramasını Kandıran Mini Web Sunucu
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Havas Radar Calisiyor!")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -65,7 +79,7 @@ def get_fr24_ist_flights():
         print(f"Radar hatasi: {err}")
     return []
 
-def run():
+def run_radar():
     print("Bot baslatildi.")
     send_telegram("🚀 <b>Havaş IST Operasyon Radarı Devrede</b>\n\nTakip Listesi: 92 Uçuş\nİnişine 30 dk kalanlar süreye göre sıralı liste olarak iletilecektir.")
 
@@ -102,6 +116,7 @@ def run():
                 est_landing = time_info.get("estimated", {}).get("arrival") or time_info.get("scheduled", {}).get("arrival")
                 real_landing = time_info.get("real", {}).get("arrival")
 
+                # Teker Koyma (İniş)
                 if generic_status == "landed" or real_landing:
                     if matched_key not in notified_landed:
                         notified_landed.add(matched_key)
@@ -116,6 +131,7 @@ def run():
                         send_telegram(msg)
                     continue
 
+                # 30 dk ve az kalanlar
                 if est_landing and matched_key not in notified_landed:
                     diff_min = (est_landing - now_ts) // 60
                     if 0 < diff_min <= 30:
@@ -130,7 +146,6 @@ def run():
                         })
 
             approaching_flights.sort(key=lambda x: x["diff"])
-
             new_approaching = [fl for fl in approaching_flights if fl["key"] not in notified_30m]
 
             if new_approaching:
@@ -153,4 +168,9 @@ def run():
             time.sleep(30)
 
 if __name__ == "__main__":
-    run()
+    # Web sunucusunu yan thread'de baslat (Render port hatasi vermesin)
+    web_thread = threading.Thread(target=start_dummy_server, daemon=True)
+    web_thread.start()
+    
+    # Ana radar dongusunu calistir
+    run_radar()
